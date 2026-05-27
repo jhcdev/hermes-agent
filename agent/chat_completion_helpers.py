@@ -34,6 +34,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, parse_qs, urlunparse
 
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
+from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import classify_api_error, FailoverReason
 from agent.model_metadata import is_local_endpoint
 from agent.message_sanitization import (
@@ -74,45 +75,6 @@ _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 # billing reasons keep their own 60s cooldown (set above); this is the
 # narrower non-rate-limit case.  See issue #24996.
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
-
-
-def _resolve_stream_stale_timeout(agent: Any, api_kwargs: Dict[str, Any]) -> float:
-    """Return the stale-stream timeout for a chat-completions request.
-
-    ``providers.<id>.stale_timeout_seconds: 0`` means "disable stale
-    detection" for non-streaming calls.  Streaming used the same config value
-    but previously treated 0 as an immediate timeout, producing endless
-    "No response from provider for 0s" reconnects.  Keep the semantics
-    consistent: configured 0 disables stream stale detection too.
-    """
-    cfg_stale = get_provider_stale_timeout(agent.provider, agent.model)
-    if cfg_stale is not None:
-        stream_stale_timeout_base = cfg_stale
-    else:
-        stream_stale_timeout_base = float(os.getenv("HERMES_STREAM_STALE_TIMEOUT", 180.0))
-
-    if stream_stale_timeout_base <= 0:
-        return float("inf")
-
-    # Local providers (Ollama, oMLX, llama-cpp) can take 300+ seconds for
-    # prefill on large contexts. Disable the stale detector unless the user
-    # explicitly set HERMES_STREAM_STALE_TIMEOUT.
-    if (
-        stream_stale_timeout_base == 180.0
-        and agent.base_url
-        and is_local_endpoint(agent.base_url)
-    ):
-        logger.debug("Local provider detected (%s) — stale stream timeout disabled", agent.base_url)
-        return float("inf")
-
-    # Scale the stale timeout for large contexts: slow models can legitimately
-    # think for minutes before producing the first token.
-    est_tokens = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
-    if est_tokens > 100_000:
-        return max(stream_stale_timeout_base, 300.0)
-    if est_tokens > 50_000:
-        return max(stream_stale_timeout_base, 240.0)
-    return stream_stale_timeout_base
 
 
 def _ra():
@@ -230,7 +192,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
     provider fallback.
     """
     result = {"response": None, "error": None}
-    request_client_holder = {"client": None}
+    request_client_holder = {"client": None, "owner_tid": None}
     request_client_lock = threading.Lock()
     # Request-local cancellation flag. Distinct from agent._interrupt_requested
     # because that flag is cleared at run_conversation() turn boundaries, but
@@ -245,17 +207,49 @@ def interruptible_api_call(agent, api_kwargs: dict):
     def _set_request_client(client):
         with request_client_lock:
             request_client_holder["client"] = client
+            # #29507: stamp the owning thread so a stranger-thread interrupt
+            # only shuts the connection down rather than racing the worker
+            # for FD ownership during ``client.close()``.
+            request_client_holder["owner_tid"] = threading.get_ident()
         return client
 
     def _take_request_client():
         with request_client_lock:
             client = request_client_holder.get("client")
             request_client_holder["client"] = None
+            request_client_holder["owner_tid"] = None
             return client
 
     def _close_request_client_once(reason: str) -> None:
-        request_client = _take_request_client()
-        if request_client is not None:
+        # #29507: dispatch on the calling thread.
+        #
+        # When ``_call`` (the worker) reaches its ``finally`` it owns the
+        # close and we pop + fully close as before. When a *stranger* thread
+        # (the interrupt-check loop, the stale-call detector) drives the
+        # close, only shut the sockets down so the worker's blocked
+        # ``recv``/``send`` unwinds with an ``EPIPE`` / EOF — and let the
+        # worker close ``client`` from its own thread on its way out. That
+        # avoids the FD-recycling race where the kernel reassigned a
+        # just-closed TLS socket FD to ``kanban.db``, and the still-live SSL
+        # BIO on the worker thread then wrote a 24-byte TLS application-data
+        # record into the SQLite header (#29507).
+        with request_client_lock:
+            request_client = request_client_holder.get("client")
+            owner_tid = request_client_holder.get("owner_tid")
+            stranger_thread = (
+                request_client is not None
+                and owner_tid is not None
+                and owner_tid != threading.get_ident()
+            )
+            if not stranger_thread:
+                # Owning thread (or no recorded owner) → pop and fully close.
+                request_client_holder["client"] = None
+                request_client_holder["owner_tid"] = None
+        if request_client is None:
+            return
+        if stranger_thread:
+            agent._abort_request_openai_client(request_client, reason=reason)
+        else:
             agent._close_request_openai_client(request_client, reason=reason)
 
     def _call():
@@ -332,9 +326,34 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # httpx timeout (default 1800s) with zero feedback.  The stale
     # detector kills the connection early so the main retry loop can
     # apply richer recovery (credential rotation, provider fallback).
-    _stale_timeout = agent._compute_non_stream_stale_timeout(
-        api_kwargs.get("messages", [])
-    )
+    _stale_timeout = agent._compute_non_stream_stale_timeout(api_kwargs)
+
+    # ── Time-to-first-byte (TTFB) watchdog for the Codex Responses stream ──
+    # The chatgpt.com/backend-api/codex endpoint has an intermittent failure
+    # mode where it accepts the connection but never emits a single stream
+    # event (observed directly: 0 events, no HTTP status, the socket just
+    # hangs). A fresh reconnect succeeds in ~2s, but the wall-clock stale
+    # timeout (often 180–900s) makes us wait minutes before retrying. While no
+    # stream event has arrived yet we apply a much shorter TTFB cutoff so the
+    # main retry loop can reconnect promptly. Once the first event arrives the
+    # stream is healthy, so we fall back to the wall-clock stale timeout and
+    # never interrupt a legitimate long generation. Gated to codex_responses:
+    # only that path streams events incrementally (the chat_completions
+    # non-stream, anthropic and bedrock branches here have no first-event
+    # signal). The marker advances on *any* event (see codex_runtime), so
+    # reasoning-only / tool-call-only turns are not mistaken for a stall.
+    # Operators can tune via HERMES_CODEX_TTFB_TIMEOUT_SECONDS (0 disables).
+    _ttfb_enabled = agent.api_mode == "codex_responses"
+    try:
+        _ttfb_timeout = float(os.getenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "45"))
+    except (TypeError, ValueError):
+        _ttfb_timeout = 45.0
+    if _ttfb_timeout <= 0:
+        _ttfb_enabled = False
+    if _ttfb_enabled:
+        # Reset before the worker starts so a marker left over from a previous
+        # call on this agent can't be misread as first-byte for this one.
+        agent._codex_stream_last_event_ts = None
 
     _call_start = time.time()
     agent._touch_activity("waiting for non-streaming API response")
@@ -354,36 +373,90 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 f"waiting for non-streaming response ({int(_elapsed)}s elapsed)"
             )
 
+        _elapsed = time.time() - _call_start
+
+        # TTFB detector: the Codex stream has produced no event at all and
+        # we're past the first-byte cutoff → the backend opened the
+        # connection but isn't responding. Kill it so the retry loop can
+        # reconnect (a fresh connection typically succeeds in seconds),
+        # instead of waiting out the much longer wall-clock stale timeout.
+        if (
+            _ttfb_enabled
+            and _elapsed > _ttfb_timeout
+            and getattr(agent, "_codex_stream_last_event_ts", None) is None
+        ):
+            _silent_hint: Optional[str] = None
+            _hint_fn = getattr(agent, "_codex_silent_hang_hint", None)
+            if callable(_hint_fn):
+                try:
+                    _silent_hint = _hint_fn(model=api_kwargs.get("model"))
+                except Exception:
+                    _silent_hint = None
+            logger.warning(
+                "Codex stream produced no bytes within TTFB cutoff "
+                "(%.0fs > %.0fs, model=%s). Backend accepted the connection "
+                "but sent no stream events. Killing connection so the retry "
+                "loop can reconnect.",
+                _elapsed, _ttfb_timeout, api_kwargs.get("model", "unknown"),
+            )
+            if _silent_hint:
+                agent._emit_status(
+                    f"⚠️ No first byte from provider in {int(_elapsed)}s "
+                    f"(codex stream, model: {api_kwargs.get('model', 'unknown')}). "
+                    f"Reconnecting. {_silent_hint}"
+                )
+            else:
+                agent._emit_status(
+                    f"⚠️ No first byte from provider in {int(_elapsed)}s "
+                    f"(codex stream, model: {api_kwargs.get('model', 'unknown')}). "
+                    f"Reconnecting."
+                )
+            try:
+                _close_request_client_once("codex_ttfb_kill")
+            except Exception:
+                pass
+            agent._touch_activity(
+                f"codex stream killed after {int(_elapsed)}s with no first byte"
+            )
+            # Wait briefly for the worker to notice the closed connection.
+            t.join(timeout=2.0)
+            if result["error"] is None and result["response"] is None:
+                if _silent_hint:
+                    result["error"] = TimeoutError(
+                        f"Codex stream produced no bytes within {int(_elapsed)}s "
+                        f"(TTFB threshold: {int(_ttfb_timeout)}s). {_silent_hint}"
+                    )
+                else:
+                    result["error"] = TimeoutError(
+                        f"Codex stream produced no bytes within {int(_elapsed)}s "
+                        f"(TTFB threshold: {int(_ttfb_timeout)}s)"
+                    )
+            break
+
         # Stale-call detector: kill the connection if no response
         # arrives within the configured timeout.
-        _elapsed = time.time() - _call_start
         if _elapsed > _stale_timeout:
-            _est_ctx = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
+            _est_ctx = estimate_request_context_tokens(api_kwargs)
+            _silent_hint: Optional[str] = None
+            _hint_fn = getattr(agent, "_codex_silent_hang_hint", None)
+            if callable(_hint_fn):
+                try:
+                    _silent_hint = _hint_fn(model=api_kwargs.get("model"))
+                except Exception:
+                    _silent_hint = None
             logger.warning(
                 "Non-streaming API call stale for %.0fs (threshold %.0fs). "
                 "model=%s context=~%s tokens. Killing connection.",
                 _elapsed, _stale_timeout,
                 api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
             )
-            # Mark this as a Hermes stale-timeout before closing the HTTP
-            # connection.  Closing can cause the worker thread to surface a
-            # generic APIConnectionError instead of TimeoutError; the main
-            # retry loop needs this sentinel to skip primary transport
-            # recovery and go straight to fallback.
-            try:
-                agent._last_non_stream_stale_timeout = {
-                    "at": time.time(),
-                    "model": api_kwargs.get("model", "unknown"),
-                    "elapsed": _elapsed,
-                    "threshold": _stale_timeout,
-                }
-            except Exception:
-                pass
-            _fallback_available = (
-                getattr(agent, "_fallback_index", 0)
-                < len(getattr(agent, "_fallback_chain", []) or [])
-            )
-            if not _fallback_available:
+            if _silent_hint:
+                agent._emit_status(
+                    f"⚠️ No response from provider for {int(_elapsed)}s "
+                    f"(non-streaming, model: {api_kwargs.get('model', 'unknown')}). "
+                    f"{_silent_hint}"
+                )
+            else:
                 agent._emit_status(
                     f"⚠️ No response from provider for {int(_elapsed)}s "
                     f"(non-streaming, model: {api_kwargs.get('model', 'unknown')}). "
@@ -402,15 +475,18 @@ def interruptible_api_call(agent, api_kwargs: dict):
             )
             # Wait briefly for the thread to notice the closed connection.
             t.join(timeout=2.0)
-            # Prefer a deterministic TimeoutError for Hermes' own stale
-            # detector, even if closing the socket made the worker report a
-            # generic APIConnectionError.  This preserves the semantic cause
-            # for fallback classification and avoids retrying GPT again.
-            if result["response"] is None:
-                result["error"] = TimeoutError(
-                    f"Non-streaming API call timed out after {int(_elapsed)}s "
-                    f"with no response (threshold: {int(_stale_timeout)}s)"
-                )
+            if result["error"] is None and result["response"] is None:
+                if _silent_hint:
+                    result["error"] = TimeoutError(
+                        f"Non-streaming API call timed out after {int(_elapsed)}s "
+                        f"with no response (threshold: {int(_stale_timeout)}s). "
+                        f"{_silent_hint}"
+                    )
+                else:
+                    result["error"] = TimeoutError(
+                        f"Non-streaming API call timed out after {int(_elapsed)}s "
+                        f"with no response (threshold: {int(_stale_timeout)}s)"
+                    )
             break
 
         if agent._interrupt_requested:
@@ -525,11 +601,15 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             reasoning_config=agent.reasoning_config,
             session_id=getattr(agent, "session_id", None),
             max_tokens=agent.max_tokens,
+            timeout=agent._resolved_api_call_timeout(),
             request_overrides=agent.request_overrides,
             is_github_responses=is_github_responses,
             is_codex_backend=is_codex_backend,
             is_xai_responses=is_xai_responses,
             github_reasoning_extra=agent._github_models_reasoning_extra_body() if is_github_responses else None,
+            replay_encrypted_reasoning=bool(
+                getattr(agent, "_codex_reasoning_replay_enabled", True)
+            ),
         )
 
     # ── chat_completions (default) ─────────────────────────────────────
@@ -745,6 +825,17 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
     if isinstance(_san_content, str) and _san_content:
         _san_content = agent._strip_think_blocks(_san_content).strip()
 
+    # Defence-in-depth: redact credentials (PATs, API keys, Bearer tokens)
+    # from assistant content BEFORE the message enters conversation history.
+    # If the model accidentally inlines a secret in its natural-language
+    # response, catch it here at the persistence boundary so it never
+    # reaches state.db, session_*.json, gateway delivery, or compression.
+    # Respects HERMES_REDACT_SECRETS via redact_sensitive_text — no-op
+    # when disabled. (#19798)
+    if isinstance(_san_content, str) and _san_content:
+        from agent.redact import redact_sensitive_text
+        _san_content = redact_sensitive_text(_san_content)
+
     msg = {
         "role": "assistant",
         "content": _san_content,
@@ -951,25 +1042,6 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
-    try:
-        from hermes_cli.config import load_config
-
-        _cfg = load_config() or {}
-        _fb_cfg = _cfg.get("fallback") if isinstance(_cfg, dict) else None
-        _only_on_quota = bool(
-            isinstance(_fb_cfg, dict)
-            and _fb_cfg.get("only_on_quota", False)
-        )
-    except Exception:
-        _only_on_quota = False
-
-    if _only_on_quota and reason not in {FailoverReason.rate_limit, FailoverReason.billing}:
-        logging.info(
-            "Fallback blocked by fallback.only_on_quota=true (reason=%s)",
-            getattr(reason, "value", reason),
-        )
-        return False
-
     if reason in {FailoverReason.rate_limit, FailoverReason.billing}:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the
@@ -1012,7 +1084,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     current_base_url = str(getattr(agent, "base_url", "") or "").rstrip("/").lower()
     fb_base_url_for_dedup = (fb.get("base_url") or "").strip().rstrip("/").lower()
     if fb_provider == current_provider and fb_model == current_model:
-        logging.warning(
+        logger.warning(
             "Fallback skip: chain entry %s/%s matches current provider/model",
             fb_provider, fb_model,
         )
@@ -1023,7 +1095,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         and fb_base_url_for_dedup == current_base_url
         and fb_model == current_model
     ):
-        logging.warning(
+        logger.warning(
             "Fallback skip: chain entry base_url %s matches current backend",
             fb_base_url_for_dedup,
         )
@@ -1055,7 +1127,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             explicit_base_url=fb_base_url_hint,
             explicit_api_key=fb_api_key_hint)
         if fb_client is None:
-            logging.warning(
+            logger.warning(
                 "Fallback to %s failed: provider not configured",
                 fb_provider)
             return agent._try_activate_fallback()  # try next in chain
@@ -1063,8 +1135,11 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             from hermes_cli.model_normalize import normalize_model_for_provider
 
             fb_model = normalize_model_for_provider(fb_model, fb_provider)
-        except Exception:
-            pass
+        except Exception as _norm_err:
+            logger.warning(
+                "Could not normalize fallback model %r for provider %r: %s",
+                fb_model, fb_provider, _norm_err,
+            )
 
         # Determine api_mode from provider / base URL / model
         fb_api_mode = "chat_completions"
@@ -1229,19 +1304,20 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 base_url=agent.base_url,
                 api_key=getattr(agent, "api_key", ""),  # callable preserved → call_llm
                 provider=agent.provider,
+                api_mode=agent.api_mode,
             )
 
         agent._emit_status(
             f"🔄 Primary model failed — switching to fallback: "
             f"{fb_model} via {fb_provider}"
         )
-        logging.info(
+        logger.info(
             "Fallback activated: %s → %s (%s)",
             old_model, fb_model, fb_provider,
         )
         return True
     except Exception as e:
-        logging.error("Failed to activate fallback %s: %s", fb_model, e)
+        logger.error("Failed to activate fallback %s: %s", fb_model, e)
         return agent._try_activate_fallback()  # try next in chain
 
 
@@ -1470,7 +1546,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 final_response = "I reached the iteration limit and couldn't generate a summary."
 
     except Exception as e:
-        logging.warning(f"Failed to get summary response: {e}")
+        logger.warning(f"Failed to get summary response: {e}")
         final_response = f"I reached the maximum iterations ({agent.max_iterations}) but couldn't summarize. Error: {str(e)}"
 
     return final_response
@@ -1499,12 +1575,12 @@ def cleanup_task_resources(agent, task_id: str) -> None:
             _ra().cleanup_vm(task_id)
     except Exception as e:
         if agent.verbose_logging:
-            logging.warning(f"Failed to cleanup VM for task {task_id}: {e}")
+            logger.warning(f"Failed to cleanup VM for task {task_id}: {e}")
     try:
         _ra().cleanup_browser(task_id)
     except Exception as e:
         if agent.verbose_logging:
-            logging.warning(f"Failed to cleanup browser for task {task_id}: {e}")
+            logger.warning(f"Failed to cleanup browser for task {task_id}: {e}")
 
 
 
@@ -1633,7 +1709,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         return result["response"]
 
     result = {"response": None, "error": None, "partial_tool_names": []}
-    request_client_holder = {"client": None, "diag": None}
+    request_client_holder = {"client": None, "diag": None, "owner_tid": None}
     request_client_lock = threading.Lock()
     # Request-local cancellation flag — see interruptible_api_call for the full
     # rationale. The streaming retry loop is where the 7-minute cascading-
@@ -1647,17 +1723,38 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     def _set_request_client(client):
         with request_client_lock:
             request_client_holder["client"] = client
+            # See #29507 explanation in the non-streaming variant above.
+            request_client_holder["owner_tid"] = threading.get_ident()
         return client
 
     def _take_request_client():
         with request_client_lock:
             client = request_client_holder.get("client")
             request_client_holder["client"] = None
+            request_client_holder["owner_tid"] = None
             return client
 
     def _close_request_client_once(reason: str) -> None:
-        request_client = _take_request_client()
-        if request_client is not None:
+        # See #29507 explanation in the non-streaming variant above. A
+        # stranger thread (the interrupt-check / stale-stream detector loop)
+        # only aborts sockets — never pops, never calls ``client.close()`` —
+        # so the worker thread retains ownership of the FD release.
+        with request_client_lock:
+            request_client = request_client_holder.get("client")
+            owner_tid = request_client_holder.get("owner_tid")
+            stranger_thread = (
+                request_client is not None
+                and owner_tid is not None
+                and owner_tid != threading.get_ident()
+            )
+            if not stranger_thread:
+                request_client_holder["client"] = None
+                request_client_holder["owner_tid"] = None
+        if request_client is None:
+            return
+        if stranger_thread:
+            agent._abort_request_openai_client(request_client, reason=reason)
+        else:
             agent._close_request_openai_client(request_client, reason=reason)
 
     first_delta_fired = {"done": False}
@@ -2513,7 +2610,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # inner retry loop can start a fresh connection.
         _stale_elapsed = time.time() - last_chunk_time["t"]
         if _stale_elapsed > _stream_stale_timeout:
-            _est_ctx = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
+            _est_ctx = estimate_request_context_tokens(api_kwargs)
             logger.warning(
                 "Stream stale for %.0fs (threshold %.0fs) — no chunks received. "
                 "model=%s context=~%s tokens. Killing connection.",
@@ -2573,24 +2670,15 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         if deltas_were_sent["yes"]:
             # Streaming failed AFTER some tokens were already delivered to
             # the platform.  Re-raising would let the outer retry loop make
-            # a new API call, creating a duplicate message.  Return a
-            # partial "stop" response instead so the outer loop treats this
-            # turn as complete (no retry, no fallback).
-            # Recover whatever content was already streamed to the user.
-            # _current_streamed_assistant_text accumulates text fired
-            # through _fire_stream_delta, so it has exactly what the
-            # user saw before the connection died.
+            # Return a partial response stub with finish_reason="length"
+            # so the conversation loop's continuation machinery fires.
+            # tool_calls=None prevents auto-execution of incomplete calls.
             _partial_text = (
                 getattr(agent, "_current_streamed_assistant_text", "") or ""
             ).strip() or None
 
-            # If the stream died while the model was emitting a tool call,
-            # the stub below will silently set `tool_calls=None` and the
-            # agent loop will treat the turn as complete — the attempted
-            # action is lost with no user-facing signal.  Append a
-            # human-visible warning to the stub content so (a) the user
-            # knows something failed, and (b) the next turn's model sees
-            # in conversation history what was attempted and can retry.
+            # Append a user-visible warning if tool calls were dropped so
+            # the user and model both know what was attempted.
             _partial_names = list(result.get("partial_tool_names") or [])
             if _partial_names:
                 _name_str = ", ".join(_partial_names[:3])
@@ -2602,8 +2690,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     f"Ask me to retry if you want to continue."
                 )
                 _partial_text = (_partial_text or "") + _warn
-                # Also fire as a streaming delta so the user sees it now
-                # instead of only in the persisted transcript.
+                # Fire as streaming delta so the user sees it immediately.
                 try:
                     agent._fire_stream_delta(_warn)
                 except Exception:
@@ -2613,14 +2700,17 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     "of text; surfaced warning to user: %s",
                     _partial_names, len(_partial_text or ""), result["error"],
                 )
+                _stub_finish_reason = FINISH_REASON_LENGTH
             else:
                 logger.warning(
-                    "Partial stream delivered before error; returning stub "
-                    "response with %s chars of recovered content to prevent "
-                    "duplicate messages: %s",
+                    "Partial stream delivered before error; returning "
+                    "length-truncated stub with %s chars of recovered "
+                    "content so the loop can continue from where the "
+                    "stream died: %s",
                     len(_partial_text or ""),
                     result["error"],
                 )
+                _stub_finish_reason = FINISH_REASON_LENGTH
             _stub_msg = SimpleNamespace(
                 role="assistant", content=_partial_text, tool_calls=None,
                 reasoning_content=None,
@@ -2652,9 +2742,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 id=PARTIAL_STREAM_STUB_ID,
                 model=getattr(agent, "model", "unknown"),
                 choices=[SimpleNamespace(
-                    index=0, message=_stub_msg, finish_reason="stop",
+                    index=0, message=_stub_msg, finish_reason=_stub_finish_reason,
                 )],
                 usage=None,
+                _dropped_tool_names=_partial_names or None,
             )
             if _content_filter_terminated:
                 _stub._content_filter_terminated = True
