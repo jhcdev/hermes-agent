@@ -107,10 +107,13 @@ def test_stale_non_stream_close_is_single_owner(monkeypatch):
     agent = _build_agent()
     agent._compute_non_stream_stale_timeout = lambda api_payload: 0.01
 
-    with pytest.raises(APIConnectionError):
+    with pytest.raises(TimeoutError):
         agent._interruptible_api_call({"model": agent.model, "messages": []})
 
     assert request_client.close_calls == 1
+    marker = getattr(agent, "_last_non_stream_stale_timeout", None)
+    assert isinstance(marker, dict)
+    assert marker["model"] == agent.model
 
 
 def test_closed_shared_client_is_recreated_before_request(monkeypatch):
