@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>TSR Video Annotation Tool</title>
+    <link rel="stylesheet" href="./assets/app.css" />
+  </head>
+  <body>
+    <main id="app" class="workspace" data-total-frames="1001">
+      <section class="toolbar" aria-label="Annotation tools">
+        <div>
+          <p class="eyebrow">TSR Annotation</p>
+          <h1>GT and Delta Review</h1>
+        </div>
+        <div class="actions" aria-label="Primary actions">
+          <button type="button" data-action="undo">Undo</button>
+          <button type="button" data-action="redo">Redo</button>
+          <button type="button" data-action="autosave">Autosave On</button>
+          <button type="button" data-action="export">Export</button>
+        </div>
+      </section>
+
+      <section class="review-shell">
+        <aside class="panel" aria-label="Workflow">
+          <button class="mode active" type="button" data-workflow="gt">GT Annotation</button>
+          <button class="mode" type="button" data-workflow="delta">Delta Video</button>
+          <div class="progress">
+            <span>Frame</span>
+            <strong id="frame-label">1 / 1001</strong>
+            <progress id="frame-progress" max="1001" value="1"></progress>
+          </div>
+        </aside>
+
+        <section class="viewer" aria-label="Frame viewer">
+          <canvas id="annotation-canvas" width="1280" height="720"></canvas>
+          <div id="status" class="status" role="status">Ready for box, polygon, and delta edits.</div>
+        </section>
+
+        <aside class="panel" aria-label="Annotation properties">
+          <label>
+            Class
+            <select id="class-select">
+              <option>traffic-sign</option>
+              <option>vehicle</option>
+              <option>pedestrian</option>
+            </select>
+          </label>
+          <div class="shortcuts" aria-label="Keyboard shortcuts">
+            <kbd>G</kbd><span>GT</span>
+            <kbd>D</kbd><span>Delta</span>
+            <kbd>←</kbd><span>Previous</span>
+            <kbd>→</kbd><span>Next</span>
+          </div>
+        </aside>
+      </section>
+    </main>
+    <script type="module" src="./assets/app.js"></script>
+  </body>
+</html>

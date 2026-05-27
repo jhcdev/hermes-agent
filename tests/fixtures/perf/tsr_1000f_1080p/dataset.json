@@ -1,0 +1,8 @@
+{
+  "fps": 30.0,
+  "frame_height": 1080,
+  "frame_path_template": "frames/frame_{frame_index:06d}.jpg",
+  "frame_width": 1920,
+  "total_frames": 1001,
+  "video_id": "tsr_1000f_1080p"
+}

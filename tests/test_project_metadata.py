@@ -1,7 +1,19 @@
 """Regression tests for packaging metadata in pyproject.toml."""
 
+import importlib
 from pathlib import Path
+import re
 import tomllib
+
+
+_PUBLIC_MODULE_PATH_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$")
+
+
+def _load_setuptools_config():
+    pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    with pyproject_path.open("rb") as handle:
+        tool = tomllib.load(handle)["tool"]
+    return tool["setuptools"]
 
 
 def _load_optional_dependencies():
@@ -12,10 +24,52 @@ def _load_optional_dependencies():
 
 
 def _load_package_data():
-    pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
-    with pyproject_path.open("rb") as handle:
-        tool = tomllib.load(handle)["tool"]
-    return tool["setuptools"]["package-data"]
+    return _load_setuptools_config()["package-data"]
+
+
+def test_public_module_paths_are_documented_and_well_formed():
+    """Top-level public modules must stay explicitly packaged.
+
+    These names are importable module paths exposed by the wheel via
+    [tool.setuptools].py-modules. Keep this list non-empty, syntactically
+    valid, and duplicate-free so public entry points do not silently drop
+    modules from packaged builds.
+    """
+    py_modules = _load_setuptools_config().get("py-modules")
+
+    assert isinstance(py_modules, list), "[tool.setuptools].py-modules must be a list"
+    assert py_modules, "[tool.setuptools].py-modules must document at least one public module path"
+
+    malformed = [
+        module_path
+        for module_path in py_modules
+        if not isinstance(module_path, str) or not _PUBLIC_MODULE_PATH_RE.fullmatch(module_path)
+    ]
+    assert not malformed, f"Malformed public module paths in pyproject.toml: {malformed}"
+
+    seen = set()
+    duplicates = []
+    for module_path in py_modules:
+        if module_path in seen:
+            duplicates.append(module_path)
+        seen.add(module_path)
+
+    assert not duplicates, f"Duplicate public module paths in pyproject.toml: {duplicates}"
+
+
+def test_documented_public_module_paths_are_importable():
+    """Documented public modules must be safe to import as shipped APIs."""
+    py_modules = _load_setuptools_config().get("py-modules")
+    assert isinstance(py_modules, list), "[tool.setuptools].py-modules must be a list"
+
+    failures = []
+    for module_path in py_modules:
+        try:
+            importlib.import_module(module_path)
+        except Exception as exc:  # pragma: no cover - assertion reports details
+            failures.append(f"{module_path}: {type(exc).__name__}: {exc}")
+
+    assert not failures, "Documented public module imports failed:\n" + "\n".join(failures)
 
 
 def test_matrix_extra_not_in_all():

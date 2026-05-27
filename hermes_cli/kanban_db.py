@@ -1406,48 +1406,62 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "SELECT name FROM sqlite_master WHERE type='table' AND name='task_runs'"
     ).fetchone() is not None
     if runs_exist:
-        with write_txn(conn):
-            inflight = conn.execute(
-                "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
-                "       max_runtime_seconds, last_heartbeat_at, started_at "
-                "FROM tasks "
-                "WHERE status = 'running' AND current_run_id IS NULL"
-            ).fetchall()
-            for row in inflight:
-                started = row["started_at"] or int(time.time())
-                cur = conn.execute(
-                    """
-                    INSERT INTO task_runs (
-                        task_id, profile, status,
-                        claim_lock, claim_expires, worker_pid,
-                        max_runtime_seconds, last_heartbeat_at,
-                        started_at
-                    ) VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        row["id"], row["assignee"], row["claim_lock"],
-                        row["claim_expires"], row["worker_pid"],
-                        row["max_runtime_seconds"], row["last_heartbeat_at"],
-                        started,
-                    ),
-                )
-                # CAS: only install the pointer if nothing else claimed
-                # the task between our SELECT and here (shouldn't happen
-                # under the write_txn, but belt-and-suspenders). If the
-                # CAS fails we've got an orphan run_row — mark it
-                # reclaimed so it doesn't look in-flight.
-                upd = conn.execute(
-                    "UPDATE tasks SET current_run_id = ? "
-                    "WHERE id = ? AND current_run_id IS NULL",
-                    (cur.lastrowid, row["id"]),
-                )
-                if upd.rowcount != 1:
-                    conn.execute(
-                        "UPDATE task_runs SET status = 'reclaimed', "
-                        "    outcome = 'reclaimed', ended_at = ? "
-                        "WHERE id = ?",
-                        (int(time.time()), cur.lastrowid),
+        # Fast path for already-migrated databases: avoid opening a write
+        # transaction on every read-only board render.  The Slack /board UI and
+        # dispatcher both call init/connect frequently; taking BEGIN IMMEDIATE
+        # just to discover there is nothing to backfill can trip over transient
+        # SQLite/WAL I/O or locking conditions and make a read-only board fail.
+        inflight = conn.execute(
+            "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
+            "       max_runtime_seconds, last_heartbeat_at, started_at "
+            "FROM tasks "
+            "WHERE status = 'running' AND current_run_id IS NULL"
+        ).fetchall()
+        if inflight:
+            with write_txn(conn):
+                # Re-read under the write transaction so the backfill remains
+                # serialized against a concurrent dispatcher claim.
+                inflight = conn.execute(
+                    "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
+                    "       max_runtime_seconds, last_heartbeat_at, started_at "
+                    "FROM tasks "
+                    "WHERE status = 'running' AND current_run_id IS NULL"
+                ).fetchall()
+                for row in inflight:
+                    started = row["started_at"] or int(time.time())
+                    cur = conn.execute(
+                        """
+                        INSERT INTO task_runs (
+                            task_id, profile, status,
+                            claim_lock, claim_expires, worker_pid,
+                            max_runtime_seconds, last_heartbeat_at,
+                            started_at
+                        ) VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            row["id"], row["assignee"], row["claim_lock"],
+                            row["claim_expires"], row["worker_pid"],
+                            row["max_runtime_seconds"], row["last_heartbeat_at"],
+                            started,
+                        ),
                     )
+                    # CAS: only install the pointer if nothing else claimed
+                    # the task between our SELECT and here (shouldn't happen
+                    # under the write_txn, but belt-and-suspenders). If the
+                    # CAS fails we've got an orphan run_row — mark it
+                    # reclaimed so it doesn't look in-flight.
+                    upd = conn.execute(
+                        "UPDATE tasks SET current_run_id = ? "
+                        "WHERE id = ? AND current_run_id IS NULL",
+                        (cur.lastrowid, row["id"]),
+                    )
+                    if upd.rowcount != 1:
+                        conn.execute(
+                            "UPDATE task_runs SET status = 'reclaimed', "
+                            "    outcome = 'reclaimed', ended_at = ? "
+                            "WHERE id = ?",
+                            (int(time.time()), cur.lastrowid),
+                        )
 
     # One-shot event-kind rename pass. The old names ("ready", "priority",
     # "spawn_auto_blocked") still worked but were awkward on the wire;
@@ -1478,7 +1492,15 @@ def write_txn(conn: sqlite3.Connection):
     try:
         yield conn
     except Exception:
-        conn.execute("ROLLBACK")
+        # If the statement that failed caused SQLite to abandon the
+        # transaction, a bare ROLLBACK raises "cannot rollback - no transaction
+        # is active" and masks the original error.  Keep the original exception
+        # visible and only roll back while SQLite still reports an active txn.
+        if conn.in_transaction:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
         raise
     else:
         conn.execute("COMMIT")

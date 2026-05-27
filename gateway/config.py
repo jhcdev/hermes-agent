@@ -870,6 +870,8 @@ def load_gateway_config() -> GatewayConfig:
                         bridged["channel_prompts"] = channel_prompts
                 if "gateway_restart_notification" in platform_cfg:
                     bridged["gateway_restart_notification"] = platform_cfg["gateway_restart_notification"]
+                if plat == Platform.SLACK and "reply_broadcast" in platform_cfg:
+                    bridged["reply_broadcast"] = platform_cfg["reply_broadcast"]
                 enabled_was_explicit = "enabled" in platform_cfg
                 if not bridged and not enabled_was_explicit:
                     continue

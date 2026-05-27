@@ -306,3 +306,54 @@ def test_explicit_non_stream_stale_timeout_is_honored_for_local_endpoints(monkey
     )
 
     assert agent._compute_non_stream_stale_timeout([]) == 300.0
+
+
+def test_stream_stale_timeout_zero_disables_detection(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    _write_config(tmp_path, """\
+        providers:
+          opencode-go:
+            stale_timeout_seconds: 0
+        """)
+
+    from agent.chat_completion_helpers import _resolve_stream_stale_timeout
+    from run_agent import AIAgent
+    agent = AIAgent(
+        model="deepseek-v4-pro",
+        provider="opencode-go",
+        api_key="sk-dummy",
+        base_url="https://opencode.ai/zen/go/v1",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+        platform="cli",
+    )
+
+    assert _resolve_stream_stale_timeout(agent, {"messages": []}) == float("inf")
+
+
+def test_stream_stale_timeout_scales_large_context(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    _write_config(tmp_path, """\
+        providers:
+          opencode-go:
+            stale_timeout_seconds: 60
+        """)
+
+    from agent.chat_completion_helpers import _resolve_stream_stale_timeout
+    from run_agent import AIAgent
+    agent = AIAgent(
+        model="deepseek-v4-pro",
+        provider="opencode-go",
+        api_key="sk-dummy",
+        base_url="https://opencode.ai/zen/go/v1",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+        platform="cli",
+    )
+    messages = [{"role": "user", "content": "x" * 240_000}]
+
+    assert _resolve_stream_stale_timeout(agent, {"messages": messages}) == 240.0
