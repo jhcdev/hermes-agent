@@ -738,7 +738,8 @@ def _build_client_metadata(cfg: dict) -> "OAuthClientMetadata":
         )
     client_name = cfg.get("client_name", "Hermes Agent")
     scope = cfg.get("scope")
-    redirect_uri = f"http://127.0.0.1:{port}/callback"
+    redirect_host = cfg.get("redirect_host", "127.0.0.1")
+    redirect_uri = f"http://{redirect_host}:{port}/callback"
 
     metadata_kwargs: dict[str, Any] = {
         "client_name": client_name,
@@ -765,7 +766,8 @@ def _maybe_preregister_client(
     if not client_id:
         return
     port = cfg["_resolved_port"]
-    redirect_uri = f"http://127.0.0.1:{port}/callback"
+    redirect_host = cfg.get("redirect_host", "127.0.0.1")
+    redirect_uri = f"http://{redirect_host}:{port}/callback"
 
     info_dict: dict[str, Any] = {
         "client_id": client_id,

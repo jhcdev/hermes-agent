@@ -542,6 +542,7 @@ def _requires_bearer_auth(base_url: str | None) -> bool:
     normalized = normalized.rstrip("/").lower()
     return (
         normalized.startswith(("https://api.minimax.io/anthropic", "https://api.minimaxi.com/anthropic"))
+        or normalized.startswith("https://api.commandcode.ai/provider")
         or "azure.com" in normalized
     )
 

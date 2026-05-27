@@ -1132,11 +1132,17 @@ class AIAgent:
         """
         cfg = get_provider_stale_timeout(self.provider, self.model)
         if cfg is not None:
+            cfg = float(cfg)
+            if cfg <= 0:
+                return float("inf"), False
             return cfg, False
 
         env_timeout = os.getenv("HERMES_API_CALL_STALE_TIMEOUT")
         if env_timeout is not None:
-            return float(env_timeout), False
+            env_timeout_f = float(env_timeout)
+            if env_timeout_f <= 0:
+                return float("inf"), False
+            return env_timeout_f, False
 
         # Reasoning-model floor: auto-mitigation for known reasoning models
         # (Nemotron 3 Ultra, OpenAI o1/o3, Anthropic Opus 4.x thinking,
