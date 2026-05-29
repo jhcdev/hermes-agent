@@ -2382,6 +2382,50 @@ def copy_reasoning_content_for_api(agent, source_msg: dict, api_msg: dict) -> No
 
 
 
+def refresh_reasoning_content_for_active_provider(agent, api_messages: list) -> int:
+    """Refresh provider-facing reasoning echo fields after a runtime switch.
+
+    ``api_messages`` is a per-request copy that may have been built while a
+    different provider was active.  If fallback switches to a provider that
+    enforces reasoning echo-back (DeepSeek/Kimi/MiMo thinking mode), assistant
+    messages need ``reasoning_content`` re-applied before retrying.  This helper
+    mutates only the supplied API message list, never stored conversation
+    history, and returns the number of assistant messages whose
+    ``reasoning_content`` field changed.
+    """
+    changed = 0
+    for msg in api_messages or []:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        before_present = "reasoning_content" in msg
+        before_value = msg.get("reasoning_content")
+        copy_reasoning_content_for_api(agent, msg, msg)
+        after_present = "reasoning_content" in msg
+        after_value = msg.get("reasoning_content")
+        if before_present != after_present or before_value != after_value:
+            changed += 1
+    return changed
+
+
+
+def reapply_reasoning_echo_for_provider(agent, api_messages: list) -> int:
+    """Re-apply reasoning echo fields for providers that require them.
+
+    This is used immediately before a retry request can be sent after an
+    in-place provider change.  It intentionally no-ops for providers that do
+    not require thinking-mode reasoning echo-back so Codex/OpenAI-style
+    messages are not polluted with provider-specific ``reasoning_content``.
+    """
+    try:
+        needs_pad = bool(agent._needs_thinking_reasoning_pad())
+    except Exception:
+        needs_pad = False
+    if not needs_pad:
+        return 0
+    return refresh_reasoning_content_for_active_provider(agent, api_messages)
+
+
+
 def _iter_pool_sockets(client: Any):
     """Yield raw sockets reachable from an OpenAI/httpx client pool.
 
@@ -2715,6 +2759,8 @@ __all__ = [
     "sanitize_api_messages",
     "looks_like_codex_intermediate_ack",
     "copy_reasoning_content_for_api",
+    "refresh_reasoning_content_for_active_provider",
+    "reapply_reasoning_echo_for_provider",
     "cleanup_dead_connections",
     "extract_api_error_context",
     "apply_pending_steer_to_tool_results",
