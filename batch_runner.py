@@ -342,6 +342,7 @@ def _process_single_prompt(
             reasoning_config=config.get("reasoning_config"),
             prefill_messages=config.get("prefill_messages"),
             skip_context_files=True,  # Don't pollute trajectories with SOUL.md/AGENTS.md
+            load_soul_identity=True,
             skip_memory=True,  # Don't use persistent memory in batch runs
         )
 

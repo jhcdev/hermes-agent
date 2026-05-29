@@ -1841,6 +1841,7 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
             quiet_mode=True,
             platform="curator",
             skip_context_files=True,
+            load_soul_identity=True,
             skip_memory=True,
         )
         # Disable recursive nudges — the curator must never spawn its own review.
