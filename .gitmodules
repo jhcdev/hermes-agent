@@ -1,0 +1,3 @@
+[submodule "apps/agent-work-console"]
+	path = apps/agent-work-console
+	url = https://github.com/jhcdev/agent-work-console.git

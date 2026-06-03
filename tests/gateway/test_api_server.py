@@ -35,6 +35,7 @@ from gateway.platforms.api_server import (
     cors_middleware,
     security_headers_middleware,
 )
+from hermes_state import SessionDB
 
 
 # ---------------------------------------------------------------------------
@@ -439,6 +440,26 @@ class TestAuth:
         assert result is not None
         assert result.status == 401
 
+    def test_loopback_no_auth_opt_in_allows_missing_header(self):
+        config = PlatformConfig(enabled=True, extra={"key": "sk-test123", "allow_loopback_no_auth": True})
+        adapter = APIServerAdapter(config)
+        mock_request = MagicMock()
+        mock_request.headers = {}
+        mock_request.transport = None
+        mock_request.remote = "127.0.0.1"
+        assert adapter._check_auth(mock_request) is None
+
+    def test_loopback_no_auth_opt_in_rejects_non_loopback(self):
+        config = PlatformConfig(enabled=True, extra={"key": "sk-test123", "allow_loopback_no_auth": True})
+        adapter = APIServerAdapter(config)
+        mock_request = MagicMock()
+        mock_request.headers = {}
+        mock_request.transport = None
+        mock_request.remote = "192.0.2.10"
+        result = adapter._check_auth(mock_request)
+        assert result is not None
+        assert result.status == 401
+
     def test_malformed_auth_header_returns_401(self):
         config = PlatformConfig(enabled=True, extra={"key": "sk-test123"})
         adapter = APIServerAdapter(config)
@@ -557,6 +578,56 @@ def auth_adapter():
 
 
 class TestAgentExecution:
+    def test_message_response_can_truncate_large_content(self, adapter):
+        payload = adapter._message_response(
+            {"id": 1, "role": "tool", "content": "abcdef", "timestamp": 1},
+            max_content_chars=3,
+        )
+
+        assert payload["content"] == "abc"
+        assert payload["content_truncated"] is True
+        assert payload["content_omitted_chars"] == 3
+
+    def test_session_messages_for_client_includes_compressed_ancestors(self, adapter, tmp_path):
+        db = SessionDB(tmp_path / "state.db")
+        try:
+            db.create_session(session_id="root", source="api_server")
+            db.append_message("root", role="user", content="before compression")
+            db.append_message("root", role="assistant", content="saved answer")
+            db.end_session("root", end_reason="compression")
+            db.create_session(session_id="tip", source="api_server", parent_session_id="root")
+
+            messages = adapter._session_messages_for_client(db, "tip")
+
+            assert [m["content"] for m in messages] == ["before compression", "saved answer"]
+        finally:
+            db.close()
+
+    def test_session_messages_for_client_does_not_prepend_branch_parent(self, adapter, tmp_path):
+        db = SessionDB(tmp_path / "state.db")
+        try:
+            db.create_session(session_id="parent", source="api_server")
+            db.append_message("parent", role="user", content="parent prompt")
+            db.end_session("parent", end_reason="branched")
+            db.create_session(session_id="branch", source="api_server", parent_session_id="parent")
+            db.append_message("branch", role="user", content="branch prompt")
+
+            messages = adapter._session_messages_for_client(db, "branch")
+
+            assert [m["content"] for m in messages] == ["branch prompt"]
+        finally:
+            db.close()
+
+    def test_message_response_truncates_large_content_for_client_preview(self, adapter):
+        payload = adapter._message_response(
+            {"id": 1, "role": "tool", "content": "abcdef", "timestamp": 1780000000},
+            max_content_chars=3,
+        )
+
+        assert payload["content"] == "abc"
+        assert payload["content_truncated"] is True
+        assert payload["content_omitted_chars"] == 3
+
     @pytest.mark.asyncio
     async def test_run_agent_uses_session_id_as_task_id(self, adapter):
         mock_agent = MagicMock()

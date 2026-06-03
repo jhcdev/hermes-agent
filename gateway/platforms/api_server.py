@@ -34,6 +34,7 @@ Requires:
 import asyncio
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -777,6 +778,9 @@ class APIServerAdapter(BasePlatformAdapter):
             raw_port = os.getenv("API_SERVER_PORT", str(DEFAULT_PORT))
         self._port: int = _coerce_port(raw_port, DEFAULT_PORT)
         self._api_key: str = extra.get("key", os.getenv("API_SERVER_KEY", ""))
+        self._allow_loopback_no_auth: bool = self._coerce_config_bool(
+            extra.get("allow_loopback_no_auth", os.getenv("API_SERVER_ALLOW_LOOPBACK_NO_AUTH", "")),
+        )
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
         )
@@ -869,6 +873,32 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception:
             pass
         return "hermes-agent"
+
+    @staticmethod
+    def _coerce_config_bool(value: Any) -> bool:
+        """Normalize bool-ish config/env values for API server feature flags."""
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return False
+        return str(value).strip().lower() in _TRUE_REQUEST_BOOL_STRINGS
+
+    @staticmethod
+    def _request_from_loopback(request: "web.Request") -> bool:
+        """Return True when aiohttp reports the direct peer as loopback."""
+        peer_ip = ""
+        try:
+            peer = request.transport.get_extra_info("peername") if request.transport else None
+            if isinstance(peer, (tuple, list)) and peer:
+                peer_ip = str(peer[0])
+        except Exception:
+            peer_ip = ""
+        if not peer_ip:
+            peer_ip = str(getattr(request, "remote", "") or "")
+        try:
+            return ipaddress.ip_address(peer_ip).is_loopback
+        except ValueError:
+            return False
 
     def _cors_headers_for_origin(self, origin: str) -> Optional[Dict[str, str]]:
         """Return CORS headers for an allowed browser origin."""
@@ -965,6 +995,9 @@ class APIServerAdapter(BasePlatformAdapter):
         the no-key branch only exists for tests or unsupported manual wiring.
         """
         if not self._api_key:
+            return None
+
+        if self._allow_loopback_no_auth and self._request_from_loopback(request):
             return None
 
         auth_header = request.headers.get("Authorization", "")
@@ -1410,13 +1443,21 @@ class APIServerAdapter(BasePlatformAdapter):
         return payload
 
     @staticmethod
-    def _message_response(message: Dict[str, Any]) -> Dict[str, Any]:
+    def _message_response(message: Dict[str, Any], max_content_chars: Optional[int] = None) -> Dict[str, Any]:
         safe_keys = (
             "id", "session_id", "role", "content", "tool_call_id", "tool_calls",
             "tool_name", "timestamp", "token_count", "finish_reason", "reasoning",
             "reasoning_content",
         )
-        return {key: message.get(key) for key in safe_keys if key in message}
+        payload = {key: message.get(key) for key in safe_keys if key in message}
+        if max_content_chars is not None and max_content_chars >= 0 and isinstance(payload.get("content"), str):
+            content = payload["content"]
+            if len(content) > max_content_chars:
+                omitted = len(content) - max_content_chars
+                payload["content"] = content[:max_content_chars]
+                payload["content_truncated"] = True
+                payload["content_omitted_chars"] = omitted
+        return payload
 
     async def _read_json_body(self, request: "web.Request") -> tuple[Dict[str, Any], Optional["web.Response"]]:
         try:
@@ -1441,10 +1482,64 @@ class APIServerAdapter(BasePlatformAdapter):
         if db is None:
             return []
         try:
-            return db.get_messages_as_conversation(session_id)
+            return db.get_messages_as_conversation(
+                session_id,
+                include_ancestors=self._has_compression_ancestors(db, session_id),
+            )
         except Exception as exc:
             logger.warning("Failed to load session history for %s: %s", session_id, exc)
             return []
+
+    @staticmethod
+    def _has_compression_ancestors(db: Any, session_id: str) -> bool:
+        """Return True when ``session_id`` continues a compressed session.
+
+        Compression rotates a live conversation into a child session without
+        copying prior messages into that child. Client-facing APIs must still
+        present one logical transcript, but fork/branch children should not
+        blindly prepend their parents because they already copy messages.
+        """
+        current = session_id
+        for _ in range(100):
+            session = db.get_session(current)
+            parent_id = session.get("parent_session_id") if session else None
+            if not parent_id:
+                return False
+            parent = db.get_session(parent_id)
+            if not parent or parent.get("end_reason") != "compression":
+                return False
+            return True
+        return False
+
+    def _session_messages_for_client(self, db: Any, session_id: str) -> List[Dict[str, Any]]:
+        """Load client-visible messages for a logical session.
+
+        For compression continuations, include compressed ancestors so the web
+        console does not show an empty transcript immediately after Hermes has
+        compacted context and rotated to a child session.
+        """
+        if not self._has_compression_ancestors(db, session_id):
+            return db.get_messages(session_id)
+
+        chain: List[str] = []
+        current = session_id
+        for _ in range(100):
+            if not current or current in chain:
+                break
+            chain.append(current)
+            session = db.get_session(current)
+            parent_id = session.get("parent_session_id") if session else None
+            if not parent_id:
+                break
+            parent = db.get_session(parent_id)
+            if not parent or parent.get("end_reason") != "compression":
+                break
+            current = parent_id
+
+        messages: List[Dict[str, Any]] = []
+        for sid in reversed(chain):
+            messages.extend(db.get_messages(sid))
+        return messages
 
     async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
         """GET /api/sessions — list persisted Hermes sessions."""
@@ -1574,11 +1669,25 @@ class APIServerAdapter(BasePlatformAdapter):
             return err
         db = self._ensure_session_db()
         resolved_id = db.resolve_resume_session_id(session_id)
-        messages = db.get_messages(resolved_id)
+        messages = self._session_messages_for_client(db, resolved_id)
+        total_count = len(messages)
+        limit_raw = request.query.get("limit")
+        limit = None
+        if limit_raw is not None:
+            limit = self._parse_nonnegative_int(limit_raw, default=300, maximum=10_000)
+            if limit > 0:
+                messages = messages[-limit:]
+            else:
+                messages = []
+        max_content_chars = self._parse_nonnegative_int(
+            request.query.get("max_content_chars"), default=8_000, maximum=200_000,
+        ) if request.query.get("max_content_chars") is not None else None
         return web.json_response({
             "object": "list",
             "session_id": resolved_id,
-            "data": [self._message_response(m) for m in messages],
+            "data": [self._message_response(m, max_content_chars=max_content_chars) for m in messages],
+            "total_count": total_count,
+            "limit": limit,
         })
 
     async def _handle_fork_session(self, request: "web.Request") -> "web.Response":
