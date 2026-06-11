@@ -527,6 +527,79 @@ def test_is_entitlement_failure_matches_real_xai_bodies(message):
     )
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        # Exact CommandCode wire text captured for several models.
+        "MODEL_NOT_IN_PLAN: Claude Opus 4.8 available in Provider and above "
+        "plans or extra on demand usage",
+        "MODEL_NOT_IN_PLAN: Claude Fable 5 available in Provider and above "
+        "plans or extra on demand usage",
+        # Lowercase machine code on its own must still match.
+        "model_not_in_plan",
+    ],
+)
+def test_is_entitlement_failure_matches_commandcode_model_not_in_plan(message):
+    """CommandCode's per-model plan 403 is an entitlement limit, not a bad key.
+
+    Regression: a single MODEL_NOT_IN_PLAN (e.g. selecting an Opus model not
+    in the plan) made the credential pool mark the only CommandCode key
+    exhausted for an hour, so every subsequent request — including usable
+    models like claude-sonnet-4-6 — fell back to the secondary provider.
+    """
+    from run_agent import AIAgent
+
+    assert AIAgent._is_entitlement_failure(
+        {"message": message, "reason": "permission_error"},
+        403,
+    )
+
+
+def test_model_not_in_plan_403_does_not_exhaust_credential():
+    """A CommandCode MODEL_NOT_IN_PLAN 403 must leave the key usable.
+
+    The recovery path must NOT refresh or mark the credential exhausted —
+    otherwise the key sits in a 1-hour cooldown and usable models keep
+    falling back to the secondary provider.
+    """
+    from agent.error_classifier import FailoverReason
+
+    agent = _make_codex_agent()
+
+    calls = {"refresh": 0, "rotate": 0}
+
+    class _FakePool:
+        def try_refresh_current(self):
+            calls["refresh"] += 1
+            return MagicMock(id="should_not_be_called")
+
+        def mark_exhausted_and_rotate(self, **_kwargs):
+            calls["rotate"] += 1
+            return None
+
+        def has_available(self):
+            return False
+
+    agent._credential_pool = _FakePool()
+
+    error_context = {
+        "reason": "permission_error",
+        "message": "MODEL_NOT_IN_PLAN: Claude Opus 4.8 available in Provider "
+                   "and above plans or extra on demand usage",
+    }
+
+    recovered, _retried_429 = agent._recover_with_credential_pool(
+        status_code=403,
+        has_retried_429=False,
+        classified_reason=FailoverReason.auth,
+        error_context=error_context,
+    )
+
+    assert recovered is False, "Per-model plan 403 must surface, not silently recover"
+    assert calls["refresh"] == 0, "try_refresh_current must NOT be called — key is valid"
+    assert calls["rotate"] == 0, "credential must NOT be marked exhausted/rotated"
+
+
 def test_is_entitlement_failure_false_for_status_other_than_401_403():
     """200/429/500 must never be classified as entitlement, even if body matches."""
     from run_agent import AIAgent

@@ -1823,6 +1823,20 @@ class AIAgent:
             return False
         if "oauth2 access token could not be validated" in haystack:
             return False
+        # CommandCode (and similar plan-tiered resellers) return a 403 with a
+        # machine code ``MODEL_NOT_IN_PLAN`` when the *requested model* isn't
+        # included in the account's plan tier (e.g. "Claude Opus 4.8 available
+        # in Provider and above plans").  This is a per-model entitlement
+        # limit, NOT a bad credential or exhausted quota — the same key works
+        # fine for every other model in the plan.  Treating it as a
+        # refreshable auth failure made the credential pool mark the key
+        # exhausted with a 1-hour cooldown, so EVERY CommandCode request —
+        # including usable models like claude-sonnet-4-6 — silently fell back
+        # to the secondary provider for the next hour.  Classify it as an
+        # entitlement failure so the key stays healthy and only the
+        # unavailable model surfaces/falls back.
+        if "model_not_in_plan" in haystack:
+            return True
         if "do not have an active grok subscription" in haystack:
             return True
         if "out of available resources" in haystack and "grok" in haystack:
