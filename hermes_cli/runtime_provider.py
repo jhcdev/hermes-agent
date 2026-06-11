@@ -411,11 +411,17 @@ def _resolve_runtime_from_pool_entry(
             if detected:
                 api_mode = detected
 
-    # OpenCode base URLs end with /v1 for OpenAI-compatible models, but the
-    # Anthropic SDK prepends its own /v1/messages to the base_url.  Strip the
-    # trailing /v1 so the SDK constructs the correct path (e.g.
-    # https://opencode.ai/zen/go/v1/messages instead of .../v1/v1/messages).
-    if api_mode == "anthropic_messages" and provider in {"opencode-zen", "opencode-go"}:
+    # Some gateway base URLs end with /v1 for OpenAI-compatible models, but the
+    # Anthropic SDK prepends its own /v1/messages to the base_url. Strip the
+    # trailing /v1 in Anthropic Messages mode so the SDK constructs the correct
+    # path (e.g. https://opencode.ai/zen/go/v1/messages instead of
+    # .../v1/v1/messages). CommandCode uses the same shape split: GPT-like
+    # models go through /provider/v1/chat/completions, Claude models through
+    # /provider/v1/messages.
+    if api_mode == "anthropic_messages" and (
+        provider in {"opencode-zen", "opencode-go"}
+        or base_url_host_matches(base_url, "api.commandcode.ai")
+    ):
         base_url = re.sub(r"/v1/?$", "", base_url)
 
     # Optional opt-in: route OpenAI/Codex turns through `codex app-server`.
