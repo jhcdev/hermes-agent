@@ -38,6 +38,35 @@ from gateway.platforms.api_server import (
 from hermes_state import SessionDB
 
 
+# Every ``API_SERVER_*`` knob the adapter reads from the environment. The
+# adapter falls back to these when the corresponding ``extra={...}`` key is
+# absent, so an ambient value (e.g. ``API_SERVER_ALLOW_LOOPBACK_NO_AUTH`` set
+# in a deployed Hermes runtime) silently changes adapter defaults and breaks
+# auth expectations — the ``*_requires_auth`` tests would see loopback
+# TestClient requests bypass auth and get 200/404 instead of 401.
+_API_SERVER_ENV_VARS = (
+    "API_SERVER_KEY",
+    "API_SERVER_ALLOW_LOOPBACK_NO_AUTH",
+    "API_SERVER_CORS_ORIGINS",
+    "API_SERVER_MODEL_NAME",
+    "API_SERVER_HOST",
+    "API_SERVER_PORT",
+    "API_SERVER_ENABLED",
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_api_server_env(monkeypatch):
+    """Clear ambient ``API_SERVER_*`` vars so tests see deterministic defaults.
+
+    Runs before each test in this module. Tests that need a specific value
+    set it via their own ``monkeypatch.setenv(...)``, which applies after
+    this autouse fixture and is restored afterwards.
+    """
+    for name in _API_SERVER_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+
 # ---------------------------------------------------------------------------
 # check_api_server_requirements
 # ---------------------------------------------------------------------------
