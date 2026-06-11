@@ -254,6 +254,96 @@ def test_openai_native_curated_catalog_is_non_empty():
     assert len(_PROVIDER_MODELS["openai"]) >= 4
 
 
+def test_switch_model_commandcode_claude_uses_anthropic_messages(monkeypatch):
+    """CommandCode Claude picks from a user-defined provider row must not keep
+    the stale OpenAI chat/completions transport.
+
+    Regression: selecting ``claude-opus-4-8`` via /model showed success but the
+    next turn called ``/provider/v1/chat/completions`` and fell back because
+    CommandCode requires Claude models on Anthropic Messages shape.
+    """
+    monkeypatch.setenv("COMMAND_CODE_API_KEY", "cc-test")
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **kwargs: {
+            "provider": "commandcode",
+            "api_key": "cc-test",
+            "base_url": "https://api.commandcode.ai/provider/v1",
+            "api_mode": "chat_completions",
+            "model": kwargs.get("target_model") or "claude-opus-4-8",
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model",
+        lambda *args, **kwargs: {"accepted": True, "persist": True, "recognized": True},
+    )
+
+    result = switch_model(
+        raw_input="claude-opus-4-8",
+        current_provider="opencode-go",
+        current_model="deepseek-v4-pro",
+        current_base_url="https://opencode.ai/zen/go/v1",
+        current_api_key="sk-old",
+        explicit_provider="commandcode",
+        user_providers={
+            "commandcode": {
+                "name": "CommandCode",
+                "base_url": "https://api.commandcode.ai/provider/v1",
+                "api_key": "${COMMAND_CODE_API_KEY}",
+                "models": {"claude-opus-4-8": {}},
+            }
+        },
+        custom_providers=[],
+    )
+
+    assert result.success, result.error_message
+    assert result.target_provider == "commandcode"
+    assert result.new_model == "claude-opus-4-8"
+    assert result.api_mode == "anthropic_messages"
+    assert result.base_url == "https://api.commandcode.ai/provider"
+
+
+def test_switch_model_commandcode_non_claude_keeps_chat_completions(monkeypatch):
+    """CommandCode non-Claude models should still use /provider/v1 chat completions."""
+    monkeypatch.setenv("COMMAND_CODE_API_KEY", "cc-test")
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **kwargs: {
+            "provider": "commandcode",
+            "api_key": "cc-test",
+            "base_url": "https://api.commandcode.ai/provider",
+            "api_mode": "anthropic_messages",
+            "model": kwargs.get("target_model") or "gpt-5.5",
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model",
+        lambda *args, **kwargs: {"accepted": True, "persist": True, "recognized": True},
+    )
+
+    result = switch_model(
+        raw_input="gpt-5.5",
+        current_provider="commandcode",
+        current_model="claude-opus-4-8",
+        current_base_url="https://api.commandcode.ai/provider",
+        current_api_key="cc-test",
+        explicit_provider="commandcode",
+        user_providers={
+            "commandcode": {
+                "name": "CommandCode",
+                "base_url": "https://api.commandcode.ai/provider",
+                "api_key": "${COMMAND_CODE_API_KEY}",
+                "models": {"gpt-5.5": {}},
+            }
+        },
+        custom_providers=[],
+    )
+
+    assert result.success, result.error_message
+    assert result.api_mode == "chat_completions"
+    assert result.base_url == "https://api.commandcode.ai/provider/v1"
+
+
 def test_list_authenticated_providers_openai_alias_not_emitted_as_phantom(monkeypatch):
     """Bare 'openai' is an alias to the OpenRouter aggregator, NOT a directly-
     routable provider. It must NOT be emitted as its own picker row: selecting

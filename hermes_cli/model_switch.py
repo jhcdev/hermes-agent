@@ -1298,25 +1298,41 @@ def switch_model(
     if target_provider in {"opencode-zen", "opencode-go", "opencode"}:
         api_mode = opencode_model_api_mode(target_provider, new_model)
 
+    # --- CommandCode api_mode override ---
+    if target_provider == "commandcode" or (isinstance(base_url, str) and "api.commandcode.ai" in base_url):
+        from hermes_cli.models import commandcode_model_api_mode
+        api_mode = commandcode_model_api_mode(new_model)
+
     # --- Determine api_mode if not already set ---
     if not api_mode:
         api_mode = determine_api_mode(target_provider, base_url)
 
-    # OpenCode base URLs end with /v1 for OpenAI-compatible models, but the
-    # Anthropic SDK prepends its own /v1/messages to the base_url.  Strip the
-    # trailing /v1 so the SDK constructs the correct path (e.g.
-    # https://opencode.ai/zen/go/v1/messages instead of .../v1/v1/messages).
+    # OpenCode and CommandCode base URLs end with /v1 for OpenAI-compatible
+    # models, but the Anthropic SDK prepends its own /v1/messages to the
+    # base_url.  Strip the trailing /v1 so the SDK constructs the correct path
+    # (e.g. https://opencode.ai/zen/go/v1/messages instead of .../v1/v1/messages).
     # Mirrors the same logic in hermes_cli.runtime_provider.resolve_runtime_provider;
-    # without it, /model switches into an anthropic_messages-routed OpenCode
-    # model (e.g. `/model minimax-m2.7` on opencode-go, `/model claude-sonnet-4-6`
-    # on opencode-zen) hit a double /v1 and returned OpenCode's website 404 page.
+    # without it, /model switches into an anthropic_messages-routed provider
+    # model (e.g. `/model minimax-m2.7` on opencode-go, `/model claude-opus-4-8`
+    # on commandcode) can hit chat/completions or a double-/v1 endpoint.
     if (
         api_mode == "anthropic_messages"
-        and target_provider in {"opencode-zen", "opencode-go"}
+        and (
+            target_provider in {"opencode-zen", "opencode-go", "opencode", "commandcode"}
+            or (isinstance(base_url, str) and "api.commandcode.ai" in base_url)
+        )
         and isinstance(base_url, str)
         and base_url
     ):
         base_url = re.sub(r"/v1/?$", "", base_url)
+    elif (
+        target_provider == "commandcode"
+        and api_mode == "chat_completions"
+        and isinstance(base_url, str)
+        and base_url
+        and not base_url.rstrip("/").endswith("/v1")
+    ):
+        base_url = base_url.rstrip("/") + "/v1"
 
     # --- Get capabilities (legacy) ---
     capabilities = get_model_capabilities(target_provider, new_model)

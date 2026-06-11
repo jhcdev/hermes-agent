@@ -326,7 +326,15 @@ def init_agent(
     agent.provider = provider_name or ""
     agent.acp_command = acp_command or command
     agent.acp_args = list(acp_args or args or [])
-    if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse", "codex_app_server"}:
+    if agent.provider == "commandcode" or base_url_host_matches(agent.base_url, "api.commandcode.ai"):
+        from hermes_cli.models import commandcode_model_api_mode
+        agent.api_mode = commandcode_model_api_mode(agent.model)
+        if agent.api_mode == "anthropic_messages":
+            agent.base_url = re.sub(r"/v1/?$", "", agent.base_url.rstrip("/"))
+        elif agent.base_url and not agent.base_url.rstrip("/").endswith("/v1"):
+            agent.base_url = agent.base_url.rstrip("/") + "/v1"
+        base_url = agent.base_url
+    elif api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse", "codex_app_server"}:
         agent.api_mode = api_mode
     elif agent.provider == "openai-codex":
         agent.api_mode = "codex_responses"

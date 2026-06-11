@@ -1478,18 +1478,36 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     if not api_mode:
         api_mode = determine_api_mode(new_provider, base_url)
 
-    # Defense-in-depth: ensure OpenCode base_url doesn't carry a trailing
-    # /v1 into the anthropic_messages client, which would cause the SDK to
-    # hit /v1/v1/messages.  `model_switch.switch_model()` already strips
+    # CommandCode routes Claude models through Anthropic Messages and other
+    # models through OpenAI-compatible chat/completions. Normalize defensively
+    # here as direct callers may bypass hermes_cli.model_switch.switch_model().
+    if new_provider == "commandcode" or (isinstance(base_url, str) and "api.commandcode.ai" in base_url):
+        from hermes_cli.models import commandcode_model_api_mode
+        api_mode = commandcode_model_api_mode(new_model)
+
+    # Defense-in-depth: ensure OpenCode/CommandCode base_url doesn't carry a
+    # trailing /v1 into the anthropic_messages client, which would cause the SDK
+    # to hit /v1/v1/messages.  `model_switch.switch_model()` already strips
     # this, but we guard here so any direct callers (future code paths,
     # tests) can't reintroduce the double-/v1 404 bug.
     if (
         api_mode == "anthropic_messages"
-        and new_provider in {"opencode-zen", "opencode-go"}
+        and (
+            new_provider in {"opencode-zen", "opencode-go", "commandcode"}
+            or (isinstance(base_url, str) and "api.commandcode.ai" in base_url)
+        )
         and isinstance(base_url, str)
         and base_url
     ):
         base_url = re.sub(r"/v1/?$", "", base_url)
+    elif (
+        new_provider == "commandcode"
+        and api_mode == "chat_completions"
+        and isinstance(base_url, str)
+        and base_url
+        and not base_url.rstrip("/").endswith("/v1")
+    ):
+        base_url = base_url.rstrip("/") + "/v1"
 
     old_model = agent.model
     old_provider = agent.provider
