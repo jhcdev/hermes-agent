@@ -988,6 +988,53 @@ def run_conversation(
         api_request_id = f"{turn_id}:api:{api_call_count}"
         agent._current_api_request_id = api_request_id
 
+        def _prepare_retry_after_fallback_switch() -> None:
+            """Reset retry state and make the API copy match the active fallback.
+
+            ``api_messages`` is built before the retry loop.  When a /model
+            switch queued a one-shot identity note, that note can still say the
+            requested primary model even after the provider fails and we retry
+            on ``fallback_model``.  Rewrite that per-request note so the
+            fallback model does not falsely self-identify as the failed primary.
+            The persisted conversation history is left untouched.
+            """
+            nonlocal retry_count, compression_attempts
+            retry_count = 0
+            compression_attempts = 0
+            _retry.primary_recovery_attempted = False
+
+            fallback_note = (
+                f"[Note: the previous model-switch request fell back for this "
+                f"retry. The active model for this response is {agent.model} "
+                f"via {agent.provider}; use this if asked about model identity.]"
+            )
+            prefix_re = re.compile(
+                r"^\[Note: model (?:was just switched|switch requested) from .*?"
+                r"(?:Adjust your self-identification accordingly\.|"
+                r"a fallback status supersedes this note\.)\]\s*\n\n?",
+                re.DOTALL,
+            )
+            for msg in api_messages:
+                if msg.get("role") != "user":
+                    continue
+                content = msg.get("content")
+                if isinstance(content, str) and prefix_re.match(content):
+                    msg["content"] = prefix_re.sub(fallback_note + "\n\n", content, count=1)
+                    break
+                if isinstance(content, list):
+                    rewritten = False
+                    for part in content:
+                        if not isinstance(part, dict) or part.get("type") != "text":
+                            continue
+                        text = part.get("text")
+                        if isinstance(text, str) and prefix_re.match(text):
+                            part["text"] = prefix_re.sub(fallback_note + "\n\n", text, count=1)
+                            rewritten = True
+                            break
+                    if rewritten:
+                        break
+            agent._reapply_reasoning_echo_for_provider(api_messages)
+
         while retry_count < max_retries:
             # ── Nous Portal rate limit guard ──────────────────────
             # If another session already recorded that Nous is rate-
@@ -1011,11 +1058,7 @@ def run_conversation(
                         )
                         agent._buffer_status(f"⏳ {_nous_msg}")
                         if agent._try_activate_fallback():
-                            active_system_prompt = _sync_failover_system_message(
-                                agent, api_messages, active_system_prompt)
-                            retry_count = 0
-                            compression_attempts = 0
-                            _retry.primary_recovery_attempted = False
+                            _prepare_retry_after_fallback_switch()
                             continue
                         # No fallback available — surface buffered context
                         # so user sees the rate-limit message that led here.
@@ -1338,11 +1381,7 @@ def run_conversation(
                     if agent._fallback_index < len(agent._fallback_chain):
                         agent._buffer_status("⚠️ Empty/malformed response — switching to fallback...")
                     if agent._try_activate_fallback():
-                        active_system_prompt = _sync_failover_system_message(
-                            agent, api_messages, active_system_prompt)
-                        retry_count = 0
-                        compression_attempts = 0
-                        _retry.primary_recovery_attempted = False
+                        _prepare_retry_after_fallback_switch()
                         continue
 
                     # Check for error field in response (some providers include this)
@@ -1411,11 +1450,7 @@ def run_conversation(
                         if agent._has_pending_fallback():
                             agent._buffer_status(f"⚠️ Max retries ({max_retries}) for invalid responses — trying fallback...")
                         if agent._try_activate_fallback():
-                            active_system_prompt = _sync_failover_system_message(
-                                agent, api_messages, active_system_prompt)
-                            retry_count = 0
-                            compression_attempts = 0
-                            _retry.primary_recovery_attempted = False
+                            _prepare_retry_after_fallback_switch()
                             continue
                         # Terminal — flush buffered retry trace so user sees what happened.
                         agent._flush_status_buffer()
@@ -2950,11 +2985,7 @@ def run_conversation(
                         else:
                             agent._buffer_status("⚠️ Rate limited — switching to fallback provider...")
                         if agent._try_activate_fallback(reason=classified.reason):
-                            active_system_prompt = _sync_failover_system_message(
-                                agent, api_messages, active_system_prompt)
-                            retry_count = 0
-                            compression_attempts = 0
-                            _retry.primary_recovery_attempted = False
+                            _prepare_retry_after_fallback_switch()
                             continue
 
                 # ── Auth-failure provider failover ───────────────────────
@@ -3407,11 +3438,7 @@ def run_conversation(
                         else:
                             agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
                     if agent._try_activate_fallback():
-                        active_system_prompt = _sync_failover_system_message(
-                            agent, api_messages, active_system_prompt)
-                        retry_count = 0
-                        compression_attempts = 0
-                        _retry.primary_recovery_attempted = False
+                        _prepare_retry_after_fallback_switch()
                         continue
                     if api_kwargs is not None:
                         agent._dump_api_request_debug(
@@ -3563,11 +3590,7 @@ def run_conversation(
                     if agent._has_pending_fallback():
                         agent._buffer_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
                     if agent._try_activate_fallback():
-                        active_system_prompt = _sync_failover_system_message(
-                            agent, api_messages, active_system_prompt)
-                        retry_count = 0
-                        compression_attempts = 0
-                        _retry.primary_recovery_attempted = False
+                        _prepare_retry_after_fallback_switch()
                         continue
                     # Terminal — flush buffered retry/fallback trace.
                     agent._flush_status_buffer()
@@ -4644,6 +4667,7 @@ def run_conversation(
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             agent._empty_content_retries = 0
+                            _prepare_retry_after_fallback_switch()
                             agent._buffer_status(
                                 f"↻ Switched to fallback: {agent.model} "
                                 f"({agent.provider})"
