@@ -345,6 +345,18 @@ def _resolve_runtime_from_pool_entry(
         if cfg_provider == "anthropic":
             cfg_base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
         base_url = cfg_base_url or base_url or "https://api.anthropic.com"
+    elif provider == "commandcode":
+        # CommandCode serves Claude models via Anthropic Messages at
+        # /provider/v1/messages. Pool entries store the OpenAI-style
+        # /provider/v1 base for non-Claude models, so strip the trailing /v1
+        # when resolving a Claude model; otherwise the Anthropic SDK appends
+        # another /v1/messages and hits /provider/v1/v1/messages.
+        from hermes_cli.models import commandcode_model_api_mode
+        api_mode = commandcode_model_api_mode(effective_model)
+        if api_mode == "anthropic_messages":
+            base_url = re.sub(r"/v1/?$", "", base_url)
+        elif base_url and not base_url.endswith("/v1"):
+            base_url = base_url + "/v1"
     elif provider == "openrouter":
         base_url = base_url or OPENROUTER_BASE_URL
     elif provider == "xai":
@@ -1372,6 +1384,14 @@ def _resolve_explicit_runtime(
             api_mode = _copilot_runtime_api_mode(model_cfg, api_key)
         elif provider == "xai":
             api_mode = "codex_responses"
+        elif provider == "commandcode":
+            from hermes_cli.models import commandcode_model_api_mode
+            effective_model = str(model_cfg.get("default") or "").strip()
+            api_mode = commandcode_model_api_mode(effective_model)
+            if api_mode == "anthropic_messages":
+                base_url = re.sub(r"/v1/?$", "", base_url.rstrip("/"))
+            elif base_url and not base_url.rstrip("/").endswith("/v1"):
+                base_url = base_url.rstrip("/") + "/v1"
         else:
             configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
             if configured_mode:
@@ -1843,6 +1863,10 @@ def resolve_runtime_provider(
             api_mode = _copilot_runtime_api_mode(model_cfg, creds.get("api_key", ""))
         elif provider == "xai":
             api_mode = "codex_responses"
+        elif provider == "commandcode":
+            from hermes_cli.models import commandcode_model_api_mode
+            _effective = target_model or model_cfg.get("default", "")
+            api_mode = commandcode_model_api_mode(_effective)
         else:
             configured_provider = str(model_cfg.get("provider") or "").strip().lower()
             # Only honor persisted api_mode when it belongs to the same provider family.
@@ -1868,9 +1892,15 @@ def resolve_runtime_provider(
                 detected = _detect_api_mode_for_url(base_url)
                 if detected:
                     api_mode = detected
-        # Strip trailing /v1 for OpenCode Anthropic models (see comment above).
-        if api_mode == "anthropic_messages" and provider in {"opencode-zen", "opencode-go"}:
+        # Strip trailing /v1 for Anthropic Messages providers whose SDK client
+        # appends /v1/messages itself (see comments above).
+        if api_mode == "anthropic_messages" and (
+            provider in {"opencode-zen", "opencode-go", "commandcode"}
+            or base_url_host_matches(base_url, "api.commandcode.ai")
+        ):
             base_url = re.sub(r"/v1/?$", "", base_url)
+        elif provider == "commandcode" and api_mode == "chat_completions" and base_url and not base_url.rstrip("/").endswith("/v1"):
+            base_url = base_url.rstrip("/") + "/v1"
         return {
             "provider": provider,
             "api_mode": api_mode,
