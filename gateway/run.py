@@ -11124,9 +11124,10 @@ class GatewayRunner:
                         if not hasattr(_self, "_pending_model_notes"):
                             _self._pending_model_notes = {}
                         _self._pending_model_notes[_session_key] = (
-                            f"[Note: model was just switched from {_cur_model} to {result.new_model} "
+                            f"[Note: model switch requested from {_cur_model} to {result.new_model} "
                             f"via {result.provider_label or result.target_provider}. "
-                            f"Adjust your self-identification accordingly.]"
+                            f"Use this identity only if the primary model call succeeds; "
+                            f"a fallback status supersedes this note.]"
                         )
                         _self._session_model_overrides[_session_key] = {
                             "model": result.new_model,

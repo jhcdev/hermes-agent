@@ -7878,9 +7878,10 @@ class HermesCLI:
                 _cprint(f"  ⚠ Agent swap failed ({exc}); change applied to next session.")
 
         self._pending_model_switch_note = (
-            f"[Note: model was just switched from {old_model} to {result.new_model} "
+            f"[Note: model switch requested from {old_model} to {result.new_model} "
             f"via {result.provider_label or result.target_provider}. "
-            f"Adjust your self-identification accordingly.]"
+            f"Use this identity only if the primary model call succeeds; "
+            f"a fallback status supersedes this note.]"
         )
 
         provider_label = result.provider_label or result.target_provider
@@ -8124,9 +8125,10 @@ class HermesCLI:
         # knows a switch occurred (avoids injecting system messages mid-history
         # which breaks providers and prompt caching).
         self._pending_model_switch_note = (
-            f"[Note: model was just switched from {old_model} to {result.new_model} "
+            f"[Note: model switch requested from {old_model} to {result.new_model} "
             f"via {result.provider_label or result.target_provider}. "
-            f"Adjust your self-identification accordingly.]"
+            f"Use this identity only if the primary model call succeeds; "
+            f"a fallback status supersedes this note.]"
         )
 
         # Display confirmation with full metadata
