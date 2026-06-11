@@ -401,6 +401,14 @@ def _resolve_runtime_from_pool_entry(
             # Refs #16878.
             from hermes_cli.models import opencode_model_api_mode
             api_mode = opencode_model_api_mode(provider, effective_model)
+        elif base_url_host_matches(base_url, "api.commandcode.ai"):
+            # CommandCode serves Claude models via Anthropic Messages API
+            # (/provider/v1/messages) and all other models via OpenAI
+            # chat/completions (/provider/v1/chat/completions). Re-derive
+            # api_mode from the effective model so /model switches work
+            # correctly without the user needing to also change api_mode.
+            from hermes_cli.models import commandcode_model_api_mode
+            api_mode = commandcode_model_api_mode(effective_model)
         elif configured_mode and _provider_supports_explicit_api_mode(provider, configured_provider):
             api_mode = configured_mode
         else:
@@ -1458,6 +1466,29 @@ def resolve_runtime_provider(
     )
     if custom_runtime:
         custom_runtime["requested_provider"] = requested_provider
+        # For CommandCode user-defined providers, re-derive api_mode from the
+        # effective model so /model switches between Claude and non-Claude work
+        # without the user needing to also update model.api_mode in config.yaml.
+        _cr_base = str(custom_runtime.get("base_url") or "").rstrip("/")
+        if base_url_host_matches(_cr_base, "api.commandcode.ai"):
+            _cr_model = str(
+                target_model
+                or _get_model_config().get("default")
+                or custom_runtime.get("model")
+                or ""
+            ).strip()
+            if _cr_model:
+                from hermes_cli.models import commandcode_model_api_mode
+                _cr_mode = commandcode_model_api_mode(_cr_model)
+                custom_runtime["api_mode"] = _cr_mode
+                # Strip /v1 when switching to anthropic_messages so the SDK
+                # constructs /provider/v1/messages not /provider/v1/v1/messages.
+                if _cr_mode == "anthropic_messages":
+                    custom_runtime["base_url"] = re.sub(r"/v1/?$", "", _cr_base)
+                else:
+                    # Ensure /v1 is present for chat_completions path.
+                    if not _cr_base.endswith("/v1"):
+                        custom_runtime["base_url"] = _cr_base + "/v1"
         return custom_runtime
 
     provider = resolve_provider(

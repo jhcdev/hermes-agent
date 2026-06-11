@@ -3388,6 +3388,32 @@ def opencode_model_api_mode(provider_id: Optional[str], model_id: Optional[str])
     return "chat_completions"
 
 
+def commandcode_model_api_mode(model_id: Optional[str]) -> str:
+    """Determine the API mode for a CommandCode model.
+
+    CommandCode routes models behind two different API surfaces depending
+    on the model family:
+
+    - Claude models (bare name, no vendor prefix):
+        POST /provider/v1/messages  → anthropic_messages
+        e.g. ``claude-sonnet-4-6``, ``claude-haiku-4-5-20251001``
+
+    - All other models (vendor-prefixed):
+        POST /provider/v1/chat/completions  → chat_completions
+        e.g. ``gpt-5.5``, ``deepseek/deepseek-v4-pro``,
+             ``moonshotai/Kimi-K2.6``, ``MiniMaxAI/MiniMax-M2.7``,
+             ``Qwen/Qwen3.7-Max``, ``zai-org/GLM-5.1``,
+             ``google/gemini-3.5-flash``, ``stepfun/Step-3.5-Flash``
+
+    Returns ``anthropic_messages`` for Claude models, ``chat_completions``
+    for everything else.
+    """
+    normalized = (model_id or "").strip().lower()
+    if normalized.startswith("claude-"):
+        return "anthropic_messages"
+    return "chat_completions"
+
+
 def github_model_reasoning_efforts(
     model_id: Optional[str],
     *,
