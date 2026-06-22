@@ -88,6 +88,48 @@ def _ra():
     return run_agent
 
 
+def _resolve_stream_stale_timeout(agent, api_kwargs: dict) -> float:
+    """Resolve the no-chunk streaming stale timeout for one request.
+
+    Provider config takes precedence over the legacy environment default.
+    A configured value of 0 disables stale-stream detection, matching the
+    non-stream stale-timeout contract.
+    """
+    cfg_stale = get_provider_stale_timeout(agent.provider, agent.model)
+    if cfg_stale is not None:
+        stream_stale_timeout_base = cfg_stale
+    else:
+        stream_stale_timeout_base = float(os.getenv("HERMES_STREAM_STALE_TIMEOUT", 180.0))
+
+    if stream_stale_timeout_base <= 0:
+        return float("inf")
+
+    # Local providers (Ollama, oMLX, llama-cpp) can take 300+ seconds
+    # for prefill on large contexts. Disable the stale detector unless
+    # the user explicitly set HERMES_STREAM_STALE_TIMEOUT/provider config.
+    if (
+        stream_stale_timeout_base == 180.0
+        and agent.base_url
+        and is_local_endpoint(agent.base_url)
+    ):
+        logger.debug(
+            "Local provider detected (%s) — stale stream timeout disabled",
+            agent.base_url,
+        )
+        return float("inf")
+
+    # Scale the stale timeout for large contexts: slow models can legitimately
+    # think for minutes before producing the first token when the context is
+    # large. Without this, the stale detector kills healthy connections during
+    # the model's thinking phase.
+    est_tokens = estimate_request_context_tokens(api_kwargs)
+    if est_tokens > 100_000:
+        return max(stream_stale_timeout_base, 300.0)
+    if est_tokens > 50_000:
+        return max(stream_stale_timeout_base, 240.0)
+    return stream_stale_timeout_base
+
+
 def estimate_request_context_tokens(api_payload: Any) -> int:
     """Estimate context/load tokens from an API payload, dict or messages list.
 
