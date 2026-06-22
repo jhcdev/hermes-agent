@@ -1500,6 +1500,27 @@ def list_authenticated_providers(
     def _norm_url(url: str) -> str:
         return str(url or "").strip().rstrip("/").lower()
 
+    def _endpoint_keys(url: str) -> set:
+        """Normalized URL plus its ``/v1``-insensitive variant.
+
+        CommandCode/OpenCode-style endpoints are written both with and
+        without a trailing ``/v1`` (the runtime appends or strips it per
+        api_mode). Treat ``.../provider`` and ``.../provider/v1`` as the
+        same endpoint so the section-4 custom-provider dedup catches a
+        built-in row recorded under the other form. Without this a user
+        whose config carries commandcode in BOTH ``providers:`` (canonical
+        ``.../provider/v1``) and the legacy ``custom_providers:`` list
+        (``.../provider``) gets two near-identical picker rows."""
+        normed = _norm_url(url)
+        if not normed:
+            return set()
+        keys = {normed}
+        if normed.endswith("/v1"):
+            keys.add(normed[: -len("/v1")].rstrip("/"))
+        else:
+            keys.add(f"{normed}/v1")
+        return keys
+
     def _record_builtin_endpoint(slug: str) -> None:
         """Record the effective base URL for a built-in provider row.
 
@@ -1518,9 +1539,7 @@ def list_authenticated_providers(
             url = os.environ.get(pcfg.base_url_env_var, "") or ""
         if not url:
             url = getattr(pcfg, "inference_base_url", "") or ""
-        normed = _norm_url(url)
-        if normed:
-            _builtin_endpoints.add(normed)
+        _builtin_endpoints.update(_endpoint_keys(url))
 
     def _has_fast_aws_sdk_signal() -> bool:
         """Return True when explicit AWS auth config is present.

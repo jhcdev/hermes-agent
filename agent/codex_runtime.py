@@ -163,9 +163,16 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     if compressor is not None:
         try:
             compressor.update_from_response(usage_dict)
-            context_window = getattr(turn, "model_context_window", None)
-            if isinstance(context_window, int) and context_window > 0:
-                compressor.context_length = context_window
+            # Honor explicit config override: when _config_context_length is set,
+            # Codex's server-reported modelContextWindow (typically 272K for
+            # gpt-5.x) must not overwrite the user's preferred limit.
+            config_override = getattr(agent, "_config_context_length", None)
+            if config_override is None or not (
+                isinstance(config_override, int) and config_override > 0
+            ):
+                context_window = getattr(turn, "model_context_window", None)
+                if isinstance(context_window, int) and context_window > 0:
+                    compressor.context_length = context_window
         except Exception:
             logger.debug("codex app-server usage update failed", exc_info=True)
 
